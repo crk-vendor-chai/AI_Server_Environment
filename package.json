@@ -19,6 +19,9 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
+  "engines": {
+    "node": ">=24.22.1 <25.0.0"
+  },
   "bugs": {
     "url": "https://github.com/CHAI-Student/AI_Server_Environment/issues"
   },
