@@ -456,116 +456,111 @@ router.get("/annotation/list-all", async (req, res) => {
     if (!minioClient) {
       return res.status(500).json({ success: false, err: "minioClient not initialized" });
     }
+    const db = mongoose.connection.db;
+    if (!db) {
+      return res.status(503).json({ success: false, err: "MongoDB is not connected" });
+    }
 
     const prefix = "NewAnnotation/";
-    const folderMap = new Map(); // {folderName: {count, size}}
+    const folderMap = new Map();
+    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
 
-    const stream = minioClient.listObjectsV2(BUCKET, prefix, false); // non-recursive로 폴더만 조회
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        stream.destroy();
+        const error = new Error("MinIO object listing timed out");
+        error.code = "MINIO_LIST_TIMEOUT";
+        reject(error);
+      }, 25000);
 
-    stream.on("data", (obj) => {
-      // MinIO may return either { name: '…' } or { prefix: '…' } when recursive is false
-      const key = obj.name || obj.prefix;
-      if (!key || !key.startsWith(prefix)) return;
+      const finish = (err) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (err) reject(err);
+        else resolve();
+      };
 
-      // /NewAnnotation/D001_T001_P123/ 형태에서 D001_T001_P123 추출
-      const rel = key.slice(prefix.length);
-      const folderName = rel.split("/")[0];
+      stream.on("data", (obj) => {
+        const key = obj?.name;
+        if (!key || !key.startsWith(prefix)) return;
 
-      if (folderName && folderName !== "") {
-        if (!folderMap.has(folderName)) {
-          folderMap.set(folderName, { name: folderName, files: [], totalSize: 0 });
+        const relativeKey = key.slice(prefix.length).replace(/\/$/, "");
+        const separator = relativeKey.indexOf("/");
+        if (!relativeKey || separator === 0 || (separator < 0 && !key.endsWith("/"))) return;
+
+        const folderName = separator < 0 ? relativeKey : relativeKey.slice(0, separator);
+        let folder = folderMap.get(folderName);
+        if (!folder) {
+          folder = {
+            folderName,
+            prefix: `${prefix}${folderName}`,
+            fileCount: 0,
+            totalSize: 0,
+          };
+          folderMap.set(folderName, folder);
         }
-      }
-    });
-
-    stream.on("error", (err) => {
-      return res.status(500).json({ success: false, err: String(err) });
-    });
-
-    stream.on("end", async () => {
-      // 각 폴더 내 파일 개수 및 크기 계산
-      const folders = [];
-
-      for (const [folderName, folderInfo] of folderMap) {
-        const folderPrefix = `${prefix}${folderName}`;
-        let fileCount = 0;
-        let totalSize = 0;
-
-        const fileStream = minioClient.listObjectsV2(BUCKET, folderPrefix, true);
-
-        await new Promise((resolve, reject) => {
-          fileStream.on("data", (obj) => {
-            if (obj?.name && !obj.name.endsWith("/")) {
-              fileCount++;
-              totalSize += obj.size || 0;
-            }
-          });
-
-          fileStream.on("error", reject);
-
-          fileStream.on("end", () => {
-            folders.push({
-              folderName,
-              prefix: folderPrefix,
-              fileCount,
-              totalSize,
-              createdAt: new Date(),
-            });
-            resolve();
-          });
-        });
-      }
-
-      // attach product info from ProductsList
-      const coll = mongoose.connection.db.collection('ProductsList');
-      console.log('[ANNOTATION LIST] Starting folder processing...');
-      
-      await Promise.all(
-        folders.map(async (f) => {
-          // 폴더 구조: DivisionIdx_StorageType_TrainingIdx_ProductIdx
-          const parts = f.folderName.split('_');
-          const trainProductIdx = parts[2] || '';
-          const productIdx = parts[parts.length - 1] || '';
-          
-          f.trainingProductIdx = trainProductIdx;
-          f.productIdx = productIdx;
-          f.productEngName = '';
-          
-          try {
-            // 숫자로만 조회
-            const trainProductIdxNum = parseInt(trainProductIdx, 10);
-            if (isNaN(trainProductIdxNum)) {
-              console.log('[ANNOTATION LIST] Invalid trainProductIdx (not a number):', trainProductIdx);
-              return;
-            }
-
-            const doc = await coll.findOne(
-              { trainProductIdx: trainProductIdxNum },
-              { projection: { productEngName: 1, trainProductIdx: 1 } }
-            );
-            
-            if (doc?.productEngName) {
-              f.productEngName = doc.productEngName;
-              console.log('[ANNOTATION LIST] ✓ Found:', trainProductIdx, '->', doc.productEngName);
-            } else {
-              console.log('[ANNOTATION LIST] ✗ No match for trainProductIdx:', trainProductIdx);
-            }
-          } catch (err) {
-            console.error('[ANNOTATION LIST] Error querying MongoDB:', trainProductIdx, err.message);
-          }
-        })
-      );
-
-      return res.json({
-        success: true,
-        bucket: BUCKET,
-        prefix,
-        folders: folders.sort((a, b) => b.fileCount - a.fileCount),
-        totalFolders: folders.length,
+        if (!key.endsWith("/")) {
+          folder.fileCount++;
+          folder.totalSize += obj.size || 0;
+        }
       });
+
+      stream.once("error", finish);
+      stream.once("end", () => finish());
+    });
+
+    const folders = Array.from(folderMap.values());
+    const trainProductIds = [
+      ...new Set(
+        folders
+          .map((folder) => Number.parseInt(folder.folderName.split("_")[2] || "", 10))
+          .filter(Number.isFinite)
+      ),
+    ];
+    const coll = db.collection("ProductsList");
+    const productDocs = trainProductIds.length
+      ? await coll
+          .find(
+            { trainProductIdx: { $in: trainProductIds } },
+            { projection: { productEngName: 1, trainProductIdx: 1 } }
+          )
+          .toArray()
+      : [];
+    const productNameByTrainIdx = new Map();
+    for (const doc of productDocs) {
+      if (!productNameByTrainIdx.has(doc.trainProductIdx)) {
+        productNameByTrainIdx.set(doc.trainProductIdx, doc.productEngName || "");
+      }
+    }
+
+    for (const folder of folders) {
+      const parts = folder.folderName.split("_");
+      folder.trainingProductIdx = parts[2] || "";
+      folder.productIdx = parts[parts.length - 1] || "";
+      folder.productEngName =
+        productNameByTrainIdx.get(Number.parseInt(folder.trainingProductIdx, 10)) || "";
+      folder.createdAt = new Date();
+    }
+
+    return res.json({
+      success: true,
+      bucket: BUCKET,
+      prefix,
+      folders: folders.sort((a, b) => b.fileCount - a.fileCount),
+      totalFolders: folders.length,
     });
   } catch (e) {
-    return res.status(500).json({ success: false, err: e?.message || String(e) });
+    console.error("[ANNOTATION LIST] Failed:", e?.message || e);
+    if (res.headersSent) return;
+    const status = e?.code === "MINIO_LIST_TIMEOUT" ? 504 : 500;
+    return res.status(status).json({
+      success: false,
+      err: status === 504 ? "MinIO object listing timed out" : e?.message || String(e),
+    });
   }
 });
 
