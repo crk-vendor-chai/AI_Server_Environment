@@ -468,13 +468,19 @@ router.get("/annotation/list-all", async (req, res) => {
       const objectStream = minioClient.listObjectsV2(BUCKET, objectPrefix, recursive);
       return new Promise((resolve, reject) => {
         let settled = false;
+        let objectCount = 0;
+        const startedAt = Date.now();
         const timeout = setTimeout(() => {
           if (settled) return;
           settled = true;
           objectStream.destroy();
-          const error = new Error(`MinIO object listing timed out for ${objectPrefix}`);
+          const error = new Error(
+            `MinIO object listing timed out for ${objectPrefix} after ${objectCount} objects`
+          );
           error.code = "MINIO_LIST_TIMEOUT";
           error.prefix = objectPrefix;
+          error.objectCount = objectCount;
+          error.elapsedMs = Date.now() - startedAt;
           reject(error);
         }, 25000);
 
@@ -486,20 +492,25 @@ router.get("/annotation/list-all", async (req, res) => {
           else resolve();
         };
 
-        objectStream.on("data", onObject);
+        objectStream.on("data", (obj) => {
+          objectCount++;
+          onObject(obj);
+        });
         objectStream.once("error", finish);
         objectStream.once("end", () => finish());
       });
     };
 
     await Promise.all([
-      collectObjects(prefix, false, (obj) => {
+      collectObjects(prefix, true, (obj) => {
         const key = obj?.prefix || obj?.name;
         if (!key || !key.startsWith(prefix)) return;
 
         const relativeKey = key.slice(prefix.length).replace(/\/$/, "");
-        const folderName = relativeKey.split("/")[0];
-        if (!folderName || (!key.endsWith("/") && !relativeKey.includes("/"))) return;
+        const separator = relativeKey.indexOf("/");
+        if (!relativeKey || (separator < 0 && !key.endsWith("/"))) return;
+        const folderName = separator < 0 ? relativeKey : relativeKey.slice(0, separator);
+        if (!folderName) return;
         let folder = folderMap.get(folderName);
         if (!folder) {
           folder = {
@@ -509,6 +520,10 @@ router.get("/annotation/list-all", async (req, res) => {
             totalSize: 0,
           };
           folderMap.set(folderName, folder);
+        }
+        if (!key.endsWith("/")) {
+          folder.fileCount++;
+          folder.totalSize += obj.size || 0;
         }
       }),
       collectObjects("productAnnotation/", false, (obj) => {
@@ -527,21 +542,6 @@ router.get("/annotation/list-all", async (req, res) => {
     ]);
 
     const folders = Array.from(folderMap.values());
-    let nextFolderIndex = 0;
-    const workerCount = Math.min(4, folders.length);
-    await Promise.all(
-      Array.from({ length: workerCount }, async () => {
-        while (nextFolderIndex < folders.length) {
-          const folder = folders[nextFolderIndex++];
-          await collectObjects(`${folder.prefix}/`, true, (obj) => {
-            if (!obj?.name || obj.name.endsWith("/")) return;
-            folder.fileCount++;
-            folder.totalSize += obj.size || 0;
-          });
-        }
-      })
-    );
-
     const trainProductIds = [
       ...new Set(
         folders
@@ -587,7 +587,12 @@ router.get("/annotation/list-all", async (req, res) => {
       totalFolders: folders.length,
     });
   } catch (e) {
-    console.error("[ANNOTATION LIST] Failed:", e?.message || e, e?.prefix ? `(prefix: ${e.prefix})` : "");
+    console.error("[ANNOTATION LIST] Failed:", {
+      message: e?.message || String(e),
+      prefix: e?.prefix,
+      objectCount: e?.objectCount,
+      elapsedMs: e?.elapsedMs,
+    });
     if (res.headersSent) return;
     const status = e?.code === "MINIO_LIST_TIMEOUT" ? 504 : 500;
     return res.status(status).json({
