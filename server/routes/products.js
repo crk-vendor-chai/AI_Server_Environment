@@ -474,6 +474,7 @@ router.get("/annotation/list-all", async (req, res) => {
           objectStream.destroy();
           const error = new Error(`MinIO object listing timed out for ${objectPrefix}`);
           error.code = "MINIO_LIST_TIMEOUT";
+          error.prefix = objectPrefix;
           reject(error);
         }, 25000);
 
@@ -492,15 +493,13 @@ router.get("/annotation/list-all", async (req, res) => {
     };
 
     await Promise.all([
-      collectObjects(prefix, true, (obj) => {
-        const key = obj?.name;
+      collectObjects(prefix, false, (obj) => {
+        const key = obj?.prefix || obj?.name;
         if (!key || !key.startsWith(prefix)) return;
 
         const relativeKey = key.slice(prefix.length).replace(/\/$/, "");
-        const separator = relativeKey.indexOf("/");
-        if (!relativeKey || separator === 0 || (separator < 0 && !key.endsWith("/"))) return;
-
-        const folderName = separator < 0 ? relativeKey : relativeKey.slice(0, separator);
+        const folderName = relativeKey.split("/")[0];
+        if (!folderName || (!key.endsWith("/") && !relativeKey.includes("/"))) return;
         let folder = folderMap.get(folderName);
         if (!folder) {
           folder = {
@@ -510,10 +509,6 @@ router.get("/annotation/list-all", async (req, res) => {
             totalSize: 0,
           };
           folderMap.set(folderName, folder);
-        }
-        if (!key.endsWith("/")) {
-          folder.fileCount++;
-          folder.totalSize += obj.size || 0;
         }
       }),
       collectObjects("productAnnotation/", false, (obj) => {
@@ -532,6 +527,21 @@ router.get("/annotation/list-all", async (req, res) => {
     ]);
 
     const folders = Array.from(folderMap.values());
+    let nextFolderIndex = 0;
+    const workerCount = Math.min(4, folders.length);
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (nextFolderIndex < folders.length) {
+          const folder = folders[nextFolderIndex++];
+          await collectObjects(`${folder.prefix}/`, true, (obj) => {
+            if (!obj?.name || obj.name.endsWith("/")) return;
+            folder.fileCount++;
+            folder.totalSize += obj.size || 0;
+          });
+        }
+      })
+    );
+
     const trainProductIds = [
       ...new Set(
         folders
@@ -577,7 +587,7 @@ router.get("/annotation/list-all", async (req, res) => {
       totalFolders: folders.length,
     });
   } catch (e) {
-    console.error("[ANNOTATION LIST] Failed:", e?.message || e);
+    console.error("[ANNOTATION LIST] Failed:", e?.message || e, e?.prefix ? `(prefix: ${e.prefix})` : "");
     if (res.headersSent) return;
     const status = e?.code === "MINIO_LIST_TIMEOUT" ? 504 : 500;
     return res.status(status).json({
