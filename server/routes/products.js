@@ -463,28 +463,36 @@ router.get("/annotation/list-all", async (req, res) => {
 
     const prefix = "NewAnnotation/";
     const folderMap = new Map();
-    const stream = minioClient.listObjectsV2(BUCKET, prefix, true);
+    const uploadedProductFolders = new Set();
+    const collectObjects = (objectPrefix, recursive, onObject) => {
+      const objectStream = minioClient.listObjectsV2(BUCKET, objectPrefix, recursive);
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const timeout = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          objectStream.destroy();
+          const error = new Error(`MinIO object listing timed out for ${objectPrefix}`);
+          error.code = "MINIO_LIST_TIMEOUT";
+          reject(error);
+        }, 25000);
 
-    await new Promise((resolve, reject) => {
-      let settled = false;
-      const timeout = setTimeout(() => {
-        if (settled) return;
-        settled = true;
-        stream.destroy();
-        const error = new Error("MinIO object listing timed out");
-        error.code = "MINIO_LIST_TIMEOUT";
-        reject(error);
-      }, 25000);
+        const finish = (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timeout);
+          if (err) reject(err);
+          else resolve();
+        };
 
-      const finish = (err) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        if (err) reject(err);
-        else resolve();
-      };
+        objectStream.on("data", onObject);
+        objectStream.once("error", finish);
+        objectStream.once("end", () => finish());
+      });
+    };
 
-      stream.on("data", (obj) => {
+    await Promise.all([
+      collectObjects(prefix, true, (obj) => {
         const key = obj?.name;
         if (!key || !key.startsWith(prefix)) return;
 
@@ -507,11 +515,21 @@ router.get("/annotation/list-all", async (req, res) => {
           folder.fileCount++;
           folder.totalSize += obj.size || 0;
         }
-      });
+      }),
+      collectObjects("productAnnotation/", false, (obj) => {
+        const key = obj?.prefix || obj?.name;
+        const objectPrefix = "productAnnotation/";
+        if (!key || !key.startsWith(objectPrefix)) return;
 
-      stream.once("error", finish);
-      stream.once("end", () => finish());
-    });
+        const relativeKey = key.slice(objectPrefix.length);
+        const separator = relativeKey.indexOf("/");
+        if (separator > 0) {
+          uploadedProductFolders.add(relativeKey.slice(0, separator));
+        } else if (separator < 0 && key.endsWith("/") && relativeKey) {
+          uploadedProductFolders.add(relativeKey.slice(0, -1));
+        }
+      }),
+    ]);
 
     const folders = Array.from(folderMap.values());
     const trainProductIds = [
@@ -536,6 +554,7 @@ router.get("/annotation/list-all", async (req, res) => {
         productNameByTrainIdx.set(doc.trainProductIdx, doc.productEngName || "");
       }
     }
+    const uploadedProductFolderNames = Array.from(uploadedProductFolders);
 
     for (const folder of folders) {
       const parts = folder.folderName.split("_");
@@ -543,6 +562,10 @@ router.get("/annotation/list-all", async (req, res) => {
       folder.productIdx = parts[parts.length - 1] || "";
       folder.productEngName =
         productNameByTrainIdx.get(Number.parseInt(folder.trainingProductIdx, 10)) || "";
+      const productPrefix = `${folder.trainingProductIdx}_${folder.productEngName}_`;
+      folder.uploaded =
+        Boolean(folder.productEngName) &&
+        uploadedProductFolderNames.some((name) => name.startsWith(productPrefix));
       folder.createdAt = new Date();
     }
 
@@ -835,7 +858,8 @@ router.post("/annotation/upload-verified", (req, res) => {
       const pad = (n) => String(n).padStart(2, "0");
       const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
       const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-      const dateTimeStr = `${date}_${time}`;
+      const milliseconds = String(now.getMilliseconds()).padStart(3, "0");
+      const dateTimeStr = `${date}_${time}_${milliseconds}_${crypto.randomBytes(3).toString("hex")}`;
 
       uploadPrefix = `productAnnotation/${trainProductIdx}_${productEngName}_${dateTimeStr}`;
 

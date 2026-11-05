@@ -17,7 +17,6 @@ function LandingPage() {
   const [productEngName, setProductEngName] = useState('')
   const [zipFile, setZipFile] = useState(null)
   const [uploadLoading, setUploadLoading] = useState(false)
-  const [uploadedFolders, setUploadedFolders] = useState(new Set()) // 업로드 완료한 폴더 추적
   const [deleteLoading, setDeleteLoading] = useState(new Set())
   const [pendingUploadFolder, setPendingUploadFolder] = useState(null)
   const [confirmDelete, setConfirmDelete] = useState(null)
@@ -25,18 +24,9 @@ function LandingPage() {
   const [showCancelPopup, setShowCancelPopup] = useState(false)
   const [showSuccessPopup, setShowSuccessPopup] = useState(false)
 
-  // 초기 로드: 모든 폴더 조회 + 로컬스토리지에서 업로드 상태 복원
+  // 초기 로드: 모든 폴더와 MinIO 업로드 상태 조회
   useEffect(() => {
     loadAllFolders()
-    const saved = localStorage.getItem('uploadedFolders')
-    if (saved) {
-      try {
-        const arr = JSON.parse(saved)
-        if (Array.isArray(arr)) {
-          setUploadedFolders(new Set(arr))
-        }
-      } catch {} // parsing 실패 시 무시
-    }
   }, [])
 
   // NewAnnotation 경로의 모든 폴더 로드
@@ -170,14 +160,10 @@ function LandingPage() {
       setUploadAbortController(null)
 
       if (data.success) {
+        await loadAllFolders()
         setResponseMsg(`업로드 성공! ${data.uploadedCount}개 파일이 저장되었습니다`)
         setShowSuccessPopup(true)
         window.setTimeout(() => setShowSuccessPopup(false), 3000)
-        const newUploadedFolders = new Set(uploadedFolders)
-        newUploadedFolders.add(folder.folderName)
-        setUploadedFolders(newUploadedFolders)
-        // 로컬 스토리지에 저장
-        try { localStorage.setItem('uploadedFolders', JSON.stringify(Array.from(newUploadedFolders))) } catch {}
         // 초기화
         setZipFile(null)
         setPendingUploadFolder(null)
@@ -233,11 +219,6 @@ function LandingPage() {
         setResponseMsg(`${folderName} 폴더 삭제 완료! (${data.deletedCount}개 파일 삭제)`)
         setFolders(folders.filter(f => f.folderName !== folderName))
         if (selectedFolder?.folderName === folderName) setSelectedFolder(null)
-        // 삭제된 폴더 업로드 상태에서도 제거
-        const newUploaded = new Set(uploadedFolders)
-        newUploaded.delete(folderName)
-        setUploadedFolders(newUploaded)
-        try { localStorage.setItem('uploadedFolders', JSON.stringify(Array.from(newUploaded))) } catch {}
       } else {
         setResponseMsg(`삭제 실패: ${data.err}`)
       }
@@ -366,7 +347,7 @@ function LandingPage() {
                 </thead>
                 <tbody>
                   {displayedFolders.map((folder, idx) => {
-                    const isUploaded = uploadedFolders.has(folder.folderName)
+                    const isUploaded = folder.uploaded
                     const isDeleting = deleteLoading.has(folder.folderName)
 
                     return (
@@ -404,10 +385,11 @@ function LandingPage() {
                                 e.stopPropagation()
                                 handleStartUploadForFolder(folder)
                               }}
-                              disabled={uploadLoading || uploadedFolders.has(folder.folderName)}
+                              disabled={uploadLoading}
                               style={{ ...miniButtonStyle, background: '#ff9800' }}
+                              title={isUploaded ? '업로드 완료된 상품입니다. 클릭하면 ZIP을 다시 업로드합니다.' : ''}
                             >
-                              {uploadLoading && pendingUploadFolder?.folderName === folder.folderName ? '업로드 중...' : uploadedFolders.has(folder.folderName) ? '업로드 완료' : '검수 완료'}
+                              {uploadLoading && pendingUploadFolder?.folderName === folder.folderName ? '업로드 중...' : isUploaded ? '업로드 완료' : '검수 완료'}
                             </button>
                             {uploadLoading && pendingUploadFolder?.folderName === folder.folderName && (
                               <button
@@ -420,7 +402,7 @@ function LandingPage() {
                                 취소
                               </button>
                             )}
-                            {uploadedFolders.has(folder.folderName) && (
+                            {isUploaded && (
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation()
@@ -452,6 +434,7 @@ function LandingPage() {
           onChange={(e) => {
             const f = e.target.files?.[0] || null
             if (!f) return
+            e.target.value = ''
             console.log('[FILE_INPUT] File selected:', f.name, 'Size:', f.size, 'Type:', f.type)
             // 파일을 직접 전달하여 업로드 시작
             handleUploadVerified(f)
@@ -606,4 +589,3 @@ const miniButtonStyle = {
 }
 
 export default LandingPage
-
