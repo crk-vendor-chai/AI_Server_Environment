@@ -873,8 +873,7 @@ router.post("/annotation/upload-verified", (req, res) => {
       const pad = (n) => String(n).padStart(2, "0");
       const date = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
       const time = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-      const milliseconds = String(now.getMilliseconds()).padStart(3, "0");
-      const dateTimeStr = `${date}_${time}_${milliseconds}_${crypto.randomBytes(3).toString("hex")}`;
+      const dateTimeStr = `${date}_${time}`;
 
       uploadPrefix = `productAnnotation/${trainProductIdx}_${productEngName}_${dateTimeStr}`;
 
